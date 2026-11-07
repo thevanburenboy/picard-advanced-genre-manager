@@ -31,7 +31,7 @@ DEFAULTS = {
     "output_order": "votes",
     "apply_picard_filter": True,
     "exclusion_rules": "",
-    "write_genres_enabled": False,
+    "write_genres_enabled": True,
     "preview_enabled": False,
     "verbose_logging": False,
 }
