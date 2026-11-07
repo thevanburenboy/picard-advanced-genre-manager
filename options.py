@@ -32,8 +32,8 @@ DEFAULTS = {
     "apply_picard_filter": True,
     "exclusion_rules": "",
     "write_genres_enabled": False,
-    "preview_enabled": True,
-    "verbose_logging": True,
+    "preview_enabled": False,
+    "verbose_logging": False,
 }
 
 
