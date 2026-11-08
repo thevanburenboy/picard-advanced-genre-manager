@@ -12,10 +12,11 @@ from typing import Any
 
 from .config_access import initialize_plugin_config, picard_uses_folksonomy, read_config_value
 from .genre_engine import SOURCE_ORDER, VALID_ARTIST_POLICIES, VALID_MODES, select_genres
-from .mb_data import describe_artist_source, extract_source_counters
+from .mb_data import describe_artist_source, extract_source_data
+from .mb_request import install_user_genres_request_hook, remove_user_genres_request_hook
 from .options import DEFAULTS, GenreHierarchyOptionsPage
 
-PLUGIN_VERSION = "0.6.0"
+PLUGIN_VERSION = "0.7.0"
 
 
 def _safe_int(value: Any, default: int) -> int:
@@ -104,6 +105,10 @@ def _read_options(api) -> dict[str, Any]:
     options = {key: read_config_value(cfg, key, default) for key, default in DEFAULTS.items()}
     options["selection_mode"] = options["selection_mode"] if options["selection_mode"] in VALID_MODES else "cascade"
     options["artist_policy"] = options["artist_policy"] if options["artist_policy"] in VALID_ARTIST_POLICIES else "fallback"
+    for source in SOURCE_ORDER:
+        key = f"source_mode_{source}"
+        if options.get(key) not in {"disabled", "community", "community_and_my"}:
+            options[key] = "community"
     options["max_genres"] = max(0, min(100, _safe_int(options["max_genres"], 5)))
     options["min_genre_usage"] = max(0, min(100, _safe_int(options["min_genre_usage"], 0)))
     options["exclusion_rules"] = str(options["exclusion_rules"] or "")
@@ -131,7 +136,7 @@ def process_track(api, track, metadata, track_node, release_node=None):
         write_enabled = write_requested and global_genres_enabled
         folksonomy = picard_uses_folksonomy(global_settings)
         is_various_artists = _various_artists(metadata)
-        source_counters = extract_source_counters(
+        source_counters, personal_counters = extract_source_data(
             track_node,
             release_node,
             use_folksonomy=folksonomy,
@@ -142,11 +147,14 @@ def process_track(api, track, metadata, track_node, release_node=None):
             release_node,
             various_artists=is_various_artists,
         )
-        enabled = {
-            "recording": bool(options["source_recording"]),
-            "release": bool(options["source_release"]),
-            "release_group": bool(options["source_release_group"]),
-            "artist": bool(options["source_artist"]),
+        source_modes = {
+            source: options[f"source_mode_{source}"]
+            for source in SOURCE_ORDER
+        }
+        enabled = {source: source_modes[source] != "disabled" for source in SOURCE_ORDER}
+        personal_enabled = {
+            source: source_modes[source] == "community_and_my"
+            for source in SOURCE_ORDER
         }
 
         title = metadata.get("title", "(untitled)")
@@ -162,7 +170,7 @@ def process_track(api, track, metadata, track_node, release_node=None):
         if preview_enabled or write_enabled:
             api.logger.info(
                 "[Genre Hierarchy Manager %s] %s | recording=%s release=%s release-group=%s | "
-                "mode=%s order=%s artist_policy=%s max=%d min=%d%% folksonomy=%s enabled=%s action=%s",
+                "mode=%s order=%s artist_policy=%s max=%d min=%d%% folksonomy=%s sources=%s my=%s action=%s",
                 PLUGIN_VERSION,
                 title,
                 recording_id or "?",
@@ -174,7 +182,8 @@ def process_track(api, track, metadata, track_node, release_node=None):
                 max_genres,
                 min_usage,
                 folksonomy,
-                ",".join(source for source in SOURCE_ORDER if enabled[source]) or "<none>",
+                ",".join(f"{source}:{source_modes[source]}" for source in SOURCE_ORDER),
+                ",".join(source for source in SOURCE_ORDER if personal_enabled[source]) or "<none>",
                 "WRITE" if write_enabled else "PREVIEW",
             )
 
@@ -185,10 +194,14 @@ def process_track(api, track, metadata, track_node, release_node=None):
             api.logger.info("  Raw source counters (%s):", "folksonomy tags" if folksonomy else "MusicBrainz genres")
             for source in SOURCE_ORDER:
                 suffix = " [disabled]" if not enabled[source] else ""
-                api.logger.info("    %s%s: %s", source, suffix, _format_counter(source_counters[source]))
+                api.logger.info("    %s%s community: %s", source, suffix, _format_counter(source_counters[source]))
+                if personal_enabled[source]:
+                    api.logger.info("    %s personal: %s", source, _format_counter(personal_counters[source]))
 
         selected, eligible = select_genres(
             source_counters,
+            personal_counters=personal_counters,
+            personal_enabled=personal_enabled,
             mode=mode,
             enabled=enabled,
             max_genres=max_genres,
@@ -229,6 +242,8 @@ def process_track(api, track, metadata, track_node, release_node=None):
                     continue
                 alternative, _ = select_genres(
                     source_counters,
+                    personal_counters=personal_counters,
+                    personal_enabled=personal_enabled,
                     mode=alternative_mode,
                     enabled=enabled,
                     max_genres=max_genres,
@@ -259,9 +274,15 @@ def enable(api):
             "0.4.0 could save untouched/invalid options-page widget values."
         )
     api.register_options_page(GenreHierarchyOptionsPage)
+    install_user_genres_request_hook(api)
     api.register_track_metadata_processor(process_track, priority=-100)
     api.logger.info(
         "Genre Hierarchy Manager %s loaded — genre-tag replacement is %s",
         PLUGIN_VERSION,
         "ENABLED" if read_config_value(api.plugin_config, "write_genres_enabled", False) else "disabled (preview only)",
     )
+
+
+def disable(api=None):
+    """Restore Picard's original MusicBrainz lookup include builder."""
+    remove_user_genres_request_hook(api)

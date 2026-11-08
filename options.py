@@ -23,17 +23,17 @@ DEFAULTS = {
     "selection_mode": "cascade",
     "max_genres": 5,
     "min_genre_usage": 0,
-    "source_recording": True,
-    "source_release": True,
-    "source_release_group": True,
-    "source_artist": True,
+    "source_mode_recording": "community",
+    "source_mode_release": "community",
+    "source_mode_release_group": "community",
+    "source_mode_artist": "community",
     "artist_policy": "fallback",
     "output_order": "votes",
     "apply_picard_filter": True,
     "exclusion_rules": "",
-    "write_genres_enabled": True,
-    "preview_enabled": False,
-    "verbose_logging": False,
+    "write_genres_enabled": False,
+    "preview_enabled": True,
+    "verbose_logging": True,
 }
 
 
@@ -132,17 +132,41 @@ class GenreHierarchyOptionsPage(OptionsPage):
 
         root.addWidget(strategy_box)
 
-        sources_box = QGroupBox("Enabled genre sources — highest to lowest priority")
-        sources_layout = QVBoxLayout(sources_box)
-        self.source_checks = {
-            "recording": QCheckBox("Recording (individual track)"),
-            "release": QCheckBox("Release (specific album edition)"),
-            "release_group": QCheckBox("Release group (album across editions)"),
-            "artist": QCheckBox("Artist (final source; behavior set above)"),
+        sources_box = QGroupBox("Genre sources — highest to lowest priority")
+        sources_form = QFormLayout(sources_box)
+        self.source_modes = {}
+        source_labels = {
+            "recording": "Recording (individual track):",
+            "release": "Release (specific album edition):",
+            "release_group": "Release group (album across editions):",
+            "artist": "Artist (final source; behavior set above):",
         }
         for key in ("recording", "release", "release_group", "artist"):
-            sources_layout.addWidget(self.source_checks[key])
+            combo = QComboBox()
+            combo.addItem("Disabled", "disabled")
+            combo.addItem("Community only", "community")
+            combo.addItem("Community + My Genres", "community_and_my")
+            combo.setToolTip(
+                "Community + My Genres requests your own MusicBrainz submissions for this "
+                "entity level. Personal genres bypass minimum usage and are protected from "
+                "the maximum cutoff, but remain ordered by public vote counts. Requires "
+                "Picard to be authenticated with your MusicBrainz account."
+            )
+            self.source_modes[key] = combo
+            sources_form.addRow(source_labels[key], combo)
         root.addWidget(sources_box)
+
+        personal_help = QLabel(
+            "My Genres uses your own MusicBrainz submissions alongside community votes. "
+            "Authentication is requested automatically when any source uses Community + My Genres."
+        )
+        personal_help.setWordWrap(True)
+        personal_help.setToolTip(
+            "Curated mode reads user-genres. When Picard's global folksonomy option is enabled, "
+            "the plugin reads user-tags instead. Personal genres bypass minimum usage but do "
+            "not receive artificial vote weight."
+        )
+        root.addWidget(personal_help)
 
         data_box = QGroupBox("MusicBrainz data and filtering")
         data_layout = QVBoxLayout(data_box)
@@ -238,8 +262,10 @@ class GenreHierarchyOptionsPage(OptionsPage):
         )
         self.max_genres_spin.setValue(int(read_config_value(cfg, "max_genres", DEFAULTS["max_genres"])))
         self.min_usage_spin.setValue(int(read_config_value(cfg, "min_genre_usage", DEFAULTS["min_genre_usage"])))
-        for source, checkbox in self.source_checks.items():
-            checkbox.setChecked(bool(read_config_value(cfg, f"source_{source}", DEFAULTS[f"source_{source}"])))
+        for source, combo in self.source_modes.items():
+            combo.setCurrentIndex(max(0, combo.findData(
+                read_config_value(cfg, f"source_mode_{source}", DEFAULTS[f"source_mode_{source}"])
+            )))
         global_settings = getattr(getattr(self.api, "global_config", None), "setting", None)
         folksonomy_enabled = bool(read_config_value(global_settings, "folksonomy_tags", False))
         self.vocabulary_label.setText(
@@ -264,8 +290,8 @@ class GenreHierarchyOptionsPage(OptionsPage):
         cfg["artist_policy"] = self.artist_policy_combo.currentData() or "fallback"
         cfg["max_genres"] = self.max_genres_spin.value()
         cfg["min_genre_usage"] = self.min_usage_spin.value()
-        for source, checkbox in self.source_checks.items():
-            cfg[f"source_{source}"] = checkbox.isChecked()
+        for source, combo in self.source_modes.items():
+            cfg[f"source_mode_{source}"] = combo.currentData() or "community"
         cfg["apply_picard_filter"] = self.picard_filter_check.isChecked()
         cfg["exclusion_rules"] = self.exclusions_edit.toPlainText()
         cfg["write_genres_enabled"] = self.write_genres_check.isChecked()

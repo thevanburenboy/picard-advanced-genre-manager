@@ -1,8 +1,4 @@
-"""Source-aware genre selection engine, independent of MusicBrainz Picard.
-
-This module deliberately has no Qt or Picard imports, making the selection
-rules safe to test before connecting them to Picard's metadata pipeline.
-"""
+"""Source-aware genre selection engine, independent of MusicBrainz Picard."""
 
 from __future__ import annotations
 
@@ -13,38 +9,20 @@ from typing import Callable, Mapping
 SOURCE_ORDER = ("recording", "release", "release_group", "artist")
 BASE_SOURCES = ("recording", "release", "release_group")
 SOURCE_ALIASES = {
-    "recording": "recording",
-    "track": "recording",
-    "release": "release",
-    "release_group": "release_group",
-    "release-group": "release_group",
-    "releasegroup": "release_group",
-    "artist": "artist",
-    "all": "all",
-    "*": "all",
+    "recording": "recording", "track": "recording", "release": "release",
+    "release_group": "release_group", "release-group": "release_group",
+    "releasegroup": "release_group", "artist": "artist", "all": "all", "*": "all",
 }
 VALID_MODES = {"cascade", "strict", "combined"}
 VALID_ARTIST_POLICIES = {"fallback", "fill"}
+VALID_SOURCE_MODES = {"disabled", "community", "community_and_my"}
 
 
 def normalize_name(value: str) -> str:
-    """Normalize genre names for case-insensitive equality and deduplication."""
     return unicodedata.normalize("NFKC", str(value)).strip().casefold()
 
 
 def parse_exclusion_rules(text: str) -> dict[str, set[str]]:
-    """Parse source-scoped exact-name exclusions.
-
-    Examples::
-
-        artist: Christmas Music
-        release,release_group: Soundtrack
-        all: Spoken Word
-
-    Scope names are case-insensitive. Multiple source scopes can be comma
-    separated. Matching is Unicode-normalized, whitespace-trimmed and
-    case-insensitive. Blank lines and lines starting with # are ignored.
-    """
     rules: dict[str, set[str]] = {source: set() for source in (*SOURCE_ORDER, "all")}
     for raw_line in (text or "").splitlines():
         line = raw_line.strip()
@@ -52,17 +30,15 @@ def parse_exclusion_rules(text: str) -> dict[str, set[str]]:
             continue
         scope_text, genre_text = line.split(":", 1)
         genre = normalize_name(genre_text)
-        if not genre:
-            continue
-        for raw_scope in scope_text.split(","):
-            source = SOURCE_ALIASES.get(raw_scope.strip().casefold())
-            if source:
-                rules[source].add(genre)
+        if genre:
+            for raw_scope in scope_text.split(","):
+                source = SOURCE_ALIASES.get(raw_scope.strip().casefold())
+                if source:
+                    rules[source].add(genre)
     return rules
 
 
 def _canonical_counter(counter: Mapping[str, int] | Counter | None) -> tuple[Counter, dict[str, str]]:
-    """Return normalized keys and their first original display name."""
     normalized = Counter()
     labels: dict[str, str] = {}
     if not counter:
@@ -74,10 +50,9 @@ def _canonical_counter(counter: Mapping[str, int] | Counter | None) -> tuple[Cou
             count = int(raw_count)
         except (TypeError, ValueError, OverflowError):
             continue
-        if not key or count <= 0:
-            continue
-        labels.setdefault(key, name)
-        normalized[key] += count
+        if key and count > 0:
+            labels.setdefault(key, name)
+            normalized[key] += count
     return normalized, labels
 
 
@@ -85,18 +60,12 @@ def _excluded(source: str, genre_key: str, rules: Mapping[str, set[str]]) -> boo
     return genre_key in rules.get("all", set()) or genre_key in rules.get(source, set())
 
 
-def _filter_source(
+def _filter_names(
     source: str,
     counter: Mapping[str, int] | Counter | None,
     rules: Mapping[str, set[str]],
-    min_usage: int,
     core_filter: Callable[[str], bool] | None = None,
 ) -> tuple[Counter, dict[str, str]]:
-    """Apply exclusions, Picard-style name filters, and relative vote threshold.
-
-    ``core_filter`` is an optional predicate that returns True when a genre
-    should be skipped (Picard's TagGenreFilter.skip can be adapted to this).
-    """
     counts, labels = _canonical_counter(counter)
     kept = Counter()
     kept_labels: dict[str, str] = {}
@@ -109,33 +78,96 @@ def _filter_source(
                 if core_filter(name):
                     continue
             except Exception:
-                # A secondary Picard filter must not make selection fail.
                 pass
         kept[key] = count
         kept_labels[key] = name
+    return kept, kept_labels
 
-    if not kept:
-        return kept, kept_labels
 
+def _apply_threshold(counter: Counter, labels: dict[str, str], min_usage: int) -> tuple[Counter, dict[str, str]]:
+    kept = counter.copy()
+    kept_labels = dict(labels)
     threshold = max(0, min(100, int(min_usage)))
-    if threshold:
-        top_count = max(kept.values())
+    if kept and threshold:
+        top = max(kept.values())
         for key, count in list(kept.items()):
-            # Matches Picard TagGenreFilter.filter: integer floor percentage.
-            if (100 * count // top_count) < threshold:
+            if (100 * count // top) < threshold:
                 del kept[key]
                 kept_labels.pop(key, None)
     return kept, kept_labels
 
 
 def _ranked_keys(counter: Counter) -> list[str]:
-    # Picard sorts by descending count, then genre name.
     return sorted(counter, key=lambda key: (-counter[key], key))
+
+
+def _prepare_source(
+    source: str,
+    community_counter: Mapping[str, int] | Counter | None,
+    personal_counter: Mapping[str, int] | Counter | None,
+    rules: Mapping[str, set[str]],
+    min_usage: int,
+    core_filter: Callable[[str], bool] | None,
+    *,
+    personal_enabled: bool,
+) -> tuple[Counter, dict[str, str], set[str], Counter, dict[str, str]]:
+    """Prepare one source. Personal names bypass min usage but not exclusions/filter."""
+    community, community_labels = _filter_names(source, community_counter, rules, core_filter)
+    eligible_community, eligible_labels = _apply_threshold(community, community_labels, min_usage)
+    personal, personal_labels = _filter_names(
+        source, personal_counter if personal_enabled else Counter(), rules, core_filter
+    )
+    personal_keys = set(personal)
+    # Keep a consistent display label, preferring the community spelling.
+    labels = dict(eligible_labels)
+    for key, label in personal_labels.items():
+        labels.setdefault(key, label)
+    return eligible_community, eligible_labels, personal_keys, community, labels
+
+
+def _source_selection(
+    eligible_community: Counter,
+    eligible_labels: dict[str, str],
+    personal_keys: set[str],
+    all_community: Counter,
+    all_labels: dict[str, str],
+    limit: int,
+    output_order: str,
+) -> tuple[list[str], dict[str, int]]:
+    """Select protected personal names first, then fill with eligible community names.
+
+    Personal status protects a genre from both minimum-usage filtering and the
+    maximum cutoff. When personal genres exceed the limit, the highest public
+    vote-ranked personal genres win. Final output is still ranked by public votes.
+    """
+    if limit <= 0:
+        return [], {}
+    ranked_personal = sorted(
+        personal_keys,
+        key=lambda key: (-all_community.get(key, 0), normalize_name(all_labels.get(key, key))),
+    )
+    chosen = set(ranked_personal[:limit])
+    for key in _ranked_keys(eligible_community):
+        if len(chosen) >= limit:
+            break
+        chosen.add(key)
+
+    counts = {key: all_community.get(key, 0) for key in chosen}
+    if output_order == "alphabetical":
+        ordered = sorted(chosen, key=lambda key: normalize_name(all_labels.get(key, key)))
+    else:
+        ordered = sorted(
+            chosen,
+            key=lambda key: (-all_community.get(key, 0), normalize_name(all_labels.get(key, key))),
+        )
+    return ordered, counts
 
 
 def select_genres(
     source_counters: Mapping[str, Mapping[str, int] | Counter],
     *,
+    personal_counters: Mapping[str, Mapping[str, int] | Counter] | None = None,
+    personal_enabled: Mapping[str, bool] | None = None,
     mode: str = "cascade",
     enabled: Mapping[str, bool] | None = None,
     max_genres: int = 5,
@@ -145,32 +177,14 @@ def select_genres(
     output_order: str = "votes",
     artist_policy: str = "fallback",
 ) -> tuple[list[str], dict[str, list[str]]]:
-    """Select genres from independent MusicBrainz sources.
+    """Select source-aware community genres with optional personal-genre protection.
 
-    ``artist_policy`` controls how artist genres participate after the three
-    lower hierarchy levels have been filtered:
-      * ``fallback``: use artist genres only if no eligible lower-level genres
-        remain after exclusions, Picard's name filter and minimum usage.
-      * ``fill``: use artist genres to fill unused slots after lower-level
-        genres. Artist votes are ranked within the artist source, not compared
-        numerically with votes from recording/release/release-group sources.
-
-    In strict mode, the strict single-source contract takes precedence: only
-    the first enabled source with eligible genres is used, so artist genres are
-    reached only when no enabled lower source is populated.
-
-    Modes:
-      * ``cascade``: recording -> release -> release group, then artist
-        according to ``artist_policy``. Threshold is independent per source.
-      * ``strict``: use only the first enabled source with eligible genres.
-      * ``combined``: merge recording/release/release-group counts, apply the
-        threshold to the merged set, then use artist according to
-        ``artist_policy`` if slots remain (or if no eligible base genres exist).
-
-    ``output_order`` may be ``votes`` or ``alphabetical``. In cascade and
-    combined-fill modes, source hierarchy is preserved and votes rank genres
-    within each source/population. In ordinary combined mode, merged votes are
-    ranked globally. Ties are alphabetical.
+    Personal genres are not a separate hierarchy level. Each entity source can
+    independently include community-only or community-plus-personal data. When
+    enabled, personal names bypass minimum usage and are protected from the
+    maximum cutoff; they are still ordered by public vote counts. Public counts
+    already include the user's upvote, so personal counts are never added to
+    community counters.
     """
     if mode not in VALID_MODES:
         raise ValueError(f"Unsupported selection mode: {mode!r}")
@@ -184,32 +198,36 @@ def select_genres(
     active = {source: True for source in SOURCE_ORDER}
     if enabled is not None:
         active.update({source: bool(enabled.get(source, True)) for source in SOURCE_ORDER})
+    my_enabled = {source: False for source in SOURCE_ORDER}
+    if personal_enabled is not None:
+        my_enabled.update({source: bool(personal_enabled.get(source, False)) for source in SOURCE_ORDER})
 
+    personal_counters = personal_counters or {}
     rules = parse_exclusion_rules(exclusion_rules)
-    eligible_counters: dict[str, Counter] = {}
-    labels_by_source: dict[str, dict[str, str]] = {}
+    prepared = {}
     eligible_names: dict[str, list[str]] = {}
-
-    # Combined applies its threshold only after combining the three base
-    # sources. Artist remains independently thresholded, because its votes
-    # belong to a different entity/population.
     for source in SOURCE_ORDER:
-        threshold = 0 if mode == "combined" and source in BASE_SOURCES else min_usage
         if not active[source]:
-            eligible_counters[source] = Counter()
-            labels_by_source[source] = {}
+            prepared[source] = (Counter(), {}, set(), Counter(), {})
             eligible_names[source] = []
             continue
-        filtered, labels = _filter_source(
+        threshold = 0 if mode == "combined" and source in BASE_SOURCES else min_usage
+        prepared[source] = _prepare_source(
             source,
             source_counters.get(source, Counter()),
+            personal_counters.get(source, Counter()),
             rules,
             threshold,
             core_filter,
+            personal_enabled=my_enabled[source],
         )
-        eligible_counters[source] = filtered
-        labels_by_source[source] = labels
-        eligible_names[source] = [labels[key] for key in _ranked_keys(filtered)]
+        eligible, labels, my_keys, _all_community, all_labels = prepared[source]
+        names_by_key = dict(labels)
+        names_by_key.update({key: value for key, value in all_labels.items() if key not in names_by_key})
+        eligible_names[source] = sorted(
+            {names_by_key.get(key, key) for key in (set(eligible) | my_keys)},
+            key=lambda name: normalize_name(name),
+        )
 
     if output_order not in {"votes", "alphabetical"}:
         output_order = "votes"
@@ -218,15 +236,19 @@ def select_genres(
     selected_sources: dict[str, str] = {}
     selected_counts: dict[str, int] = {}
 
-    def add_from_source(source: str, available_slots: int) -> None:
-        if available_slots <= 0 or not active[source]:
+    def add_from_source(source: str, slots: int) -> None:
+        if slots <= 0 or not active[source]:
             return
-        for key in _ranked_keys(eligible_counters[source]):
+        eligible, eligible_labels, my_keys, all_community, all_labels = prepared[source]
+        ordered, _counts = _source_selection(
+            eligible, eligible_labels, my_keys, all_community, all_labels, slots, "votes"
+        )
+        for key in ordered:
             if key in selected:
                 continue
-            selected[key] = labels_by_source[source][key]
+            selected[key] = all_labels.get(key, eligible_labels.get(key, key))
             selected_sources[key] = source
-            selected_counts[key] = eligible_counters[source][key]
+            selected_counts[key] = all_community.get(key, 0)
             if len(selected) >= limit:
                 return
 
@@ -243,36 +265,58 @@ def select_genres(
         for source in SOURCE_ORDER:
             if not active[source]:
                 continue
-            ranked = _ranked_keys(eligible_counters[source])
-            if ranked:
-                chosen = ranked[:limit]
-                selected = {key: labels_by_source[source][key] for key in chosen}
-                selected_sources = {key: source for key in chosen}
-                selected_counts = {key: eligible_counters[source][key] for key in chosen}
+            eligible, eligible_labels, my_keys, all_community, all_labels = prepared[source]
+            chosen, _counts = _source_selection(
+                eligible, eligible_labels, my_keys, all_community, all_labels, limit, output_order
+            )
+            if chosen:
+                for key in chosen:
+                    selected[key] = all_labels.get(key, eligible_labels.get(key, key))
+                    selected_sources[key] = source
+                    selected_counts[key] = all_community.get(key, 0)
                 break
 
     else:  # combined
-        combined = Counter()
+        # Preserve the complete public vote totals separately from the
+        # threshold-filtered community candidates. Personal genres bypass the
+        # threshold, but their final order and competition for protected slots
+        # must still use the *unfiltered* combined public totals.
+        combined_public = Counter()
         combined_labels: dict[str, str] = {}
+        personal_keys: set[str] = set()
         for source in BASE_SOURCES:
             if not active[source]:
                 continue
-            for key, count in eligible_counters[source].items():
-                combined[key] += count
-                combined_labels.setdefault(key, labels_by_source[source][key])
+            _eligible, _eligible_labels, my_keys, all_community, all_labels = prepared[source]
+            for key, count in all_community.items():
+                combined_public[key] += count
+                combined_labels.setdefault(key, all_labels.get(key, key))
+            if my_enabled[source]:
+                # Personal submissions are a set across the enabled entity
+                # scopes: the same genre marked on multiple entities remains
+                # one selected genre, not multiple personal votes.
+                personal_keys.update(my_keys)
+                for key in my_keys:
+                    combined_labels.setdefault(key, all_labels.get(key, key))
 
-        if combined and min_usage:
-            top_count = max(combined.values())
-            combined = Counter({
-                key: count for key, count in combined.items()
-                if (100 * count // top_count) >= max(0, min(100, int(min_usage)))
-            })
-
-        ranked_base = _ranked_keys(combined)
-        for key in ranked_base[:limit]:
-            selected[key] = combined_labels[key]
+        eligible_combined, eligible_combined_labels = _apply_threshold(
+            combined_public, combined_labels, min_usage
+        )
+        labels_for_selection = dict(combined_labels)
+        labels_for_selection.update(eligible_combined_labels)
+        ranked_base, _counts = _source_selection(
+            eligible_combined,
+            eligible_combined_labels,
+            personal_keys,
+            combined_public,
+            labels_for_selection,
+            limit,
+            "votes",
+        )
+        for key in ranked_base:
+            selected[key] = combined_labels.get(key, key)
             selected_sources[key] = "combined"
-            selected_counts[key] = combined[key]
+            selected_counts[key] = combined_public.get(key, 0)
 
         if active["artist"] and len(selected) < limit:
             if artist_policy == "fill" or not selected:
@@ -291,8 +335,6 @@ def select_genres(
             ),
         )
     elif mode == "combined" and any(source == "artist" for source in selected_sources.values()):
-        # Lower-level combined votes first; artist fill follows, ranked within
-        # the artist population rather than compared against merged base votes.
         ordered_keys = sorted(
             selected,
             key=lambda key: (
@@ -307,5 +349,4 @@ def select_genres(
             key=lambda key: (-selected_counts.get(key, 0), normalize_name(selected[key])),
         )
 
-    result = [selected[key] for key in ordered_keys]
-    return result, eligible_names
+    return [selected[key] for key in ordered_keys], eligible_names
