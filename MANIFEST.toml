@@ -1,8 +1,8 @@
 uuid = "e2b0c519-8e2e-4f93-bc91-44b0991c9df3"
 name = "Genre Hierarchy Manager"
-description = "Configure and apply source-aware MusicBrainz genre selection in Picard 3.x."
+description = "Genre manager for MusicBrainz Picard v3 with some more in-depth controls"
 version = "0.7.0"
 api = ["3.0"]
-authors = ["OpenAI"]
-license = "GPL-2.0-or-later"
+authors = ["thevanburenboy"]
+license = "GPL-3.0"
 categories = ["metadata"]
